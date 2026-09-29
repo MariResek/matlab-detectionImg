@@ -1,0 +1,43 @@
+# =========================================================================
+# MATLAB Coder / HTML reports pesados (se regeneran con codegen)
+# =========================================================================
+**/html/report.mldatx
+**/html/rtwreport_*.html
+**/html/*.png
+**/html/*.js
+**/html/*.css
+
+# =========================================================================
+# Artefactos de compilacion en Debian / Raspberry Pi (se regeneran con make)
+# =========================================================================
+*.o
+cpp_debian/detect
+cpp_debian/run.log
+cpp_debian/strace.log
+cpp_debian/_tmp_input.png
+cpp_debian/out.png
+cpp_debian/gato_720p.png
+
+# Copia local de los .bin (se generan al correr build_codegen; los originales
+# viven adentro de yolov2_detect/ y ya se trackean)
+cpp_debian/largeDnnConstants_*.bin
+cpp_debian/networkParamsInfo_*.bin
+
+# stb headers (bajan solos con setup_rpi5.sh o al reproducir el flujo)
+cpp_debian/stb_image.h
+cpp_debian/stb_image_write.h
+
+# =========================================================================
+# MATLAB temporales
+# =========================================================================
+*.asv
+*.autosave
+*.slxc
+slprj/
+
+# =========================================================================
+# OS
+# =========================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
