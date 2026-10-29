@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <climits>    // PATH_MAX
+#include <unistd.h>   // readlink
 
 // Headers generados por MATLAB Coder
 #include "yolov2_detect.h"
@@ -17,6 +20,9 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+// Embedded 8x8 bitmap font (no external files needed)
+#include "font8x8.h"
 
 // Deben coincidir con imgType del codegen: [720 1280 3] -> 720*1280*3 = 2764800
 static constexpr int H = 720;
@@ -59,9 +65,97 @@ static void drawRect(uint8_t* img, int Hh, int Ww,
     }
 }
 
+// Solid filled rectangle, clipped to the image bounds.
+static void fillRect(uint8_t* img, int Hh, int Ww,
+                     int x, int y, int w, int h,
+                     uint8_t r, uint8_t g, uint8_t b) {
+    // Clip once up front instead of checking every pixel
+    int x0 = x < 0 ? 0 : x,          y0 = y < 0 ? 0 : y;
+    int x1 = x + w > Ww ? Ww : x + w, y1 = y + h > Hh ? Hh : y + h;
+    for (int yi = y0; yi < y1; ++yi) {
+        uint8_t* p = img + (yi * Ww + x0) * 3;
+        for (int xi = x0; xi < x1; ++xi, p += 3) { p[0] = r; p[1] = g; p[2] = b; }
+    }
+}
+
+// Draws `text` with its top-left corner at (x, y).
+// Each font pixel becomes a scale x scale block, so the text is
+// (8*scale) px tall and (8*scale) px wide per character.
+static void drawText(uint8_t* img, int Hh, int Ww,
+                     int x, int y, const char* text, int scale,
+                     uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; text[i] != '\0'; ++i) {
+        char ch = text[i];
+        if (ch < FONT_FIRST || ch > FONT_LAST) ch = '?';  // non-printable -> '?'
+        const uint8_t* glyph = FONT8X8[ch - FONT_FIRST];
+        int cx = x + i * FONT_W * scale;                   // left edge of this char
+
+        for (int row = 0; row < FONT_H; ++row) {
+            for (int col = 0; col < FONT_W; ++col) {
+                // Bit 0 is the leftmost pixel of the row
+                if ((glyph[row] >> col) & 1) {
+                    fillRect(img, Hh, Ww,
+                             cx + col * scale, y + row * scale, scale, scale,
+                             r, g, b);
+                }
+            }
+        }
+    }
+}
+
+// Label like MATLAB's insertObjectAnnotation: a filled box of the given
+// color sitting on top of the bbox, with black text inside it.
+// If there is no room above the bbox (near the top edge), it goes inside.
+static void drawLabel(uint8_t* img, int Hh, int Ww,
+                      int boxX, int boxY, const char* text, int scale,
+                      uint8_t r, uint8_t g, uint8_t b) {
+    const int pad = 2 * scale;                                // margin around text
+    const int lw  = (int)std::strlen(text) * FONT_W * scale + 2 * pad;
+    const int lh  = FONT_H * scale + 2 * pad;
+
+    int lx = boxX;
+    int ly = boxY - lh;                 // default: just above the box
+    if (ly < 0) ly = boxY;              // no room above -> inside the box
+    if (lx + lw > Ww) lx = Ww - lw;     // keep it from running off the right edge
+    if (lx < 0) lx = 0;
+
+    fillRect(img, Hh, Ww, lx, ly, lw, lh, r, g, b);
+    drawText(img, Hh, Ww, lx + pad, ly + pad, text, scale, 0, 0, 0);
+}
+
+// The MATLAB Coder code loads the network weights (largeDnnConstants_*.bin)
+// from the path used at codegen time (./codegen/lib/yolov2_detect/), and if it
+// can't open them it calls exit(1) with no error message.
+// It also checks the CODER_DATA_PATH env var, so we point it at the
+// yolov2_detect/ folder next to this executable. This works no matter which
+// directory the program is launched from. If the user already set
+// CODER_DATA_PATH, we leave it alone.
+static void setCoderDataPath() {
+    if (std::getenv("CODER_DATA_PATH") != nullptr) return;
+
+    std::string dataDir = "./yolov2_detect";  // fallback: relative to cwd
+
+    // /proc/self/exe is a symlink to this executable's absolute path (Linux)
+    char exePath[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len > 0) {
+        exePath[len] = '\0';
+        std::string exe(exePath);
+        size_t slash = exe.rfind('/');
+        if (slash != std::string::npos) {
+            dataDir = exe.substr(0, slash) + "/yolov2_detect";
+        }
+    }
+
+    setenv("CODER_DATA_PATH", dataDir.c_str(), 0);  // 0 = don't overwrite
+}
+
 int main(int argc, char** argv) {
     const char* inPath  = (argc > 1) ? argv[1] : "gato.png";
     const char* outPath = (argc > 2) ? argv[2] : "out.png";
+
+    // Must run before yolov2_detect_initialize() / yolov2_detect()
+    setCoderDataPath();
 
     // --- 1) Leer imagen ---
     int w, h, ch;
@@ -129,6 +223,20 @@ int main(int argc, char** argv) {
         drawRect(raw, H, W,
                  (int)bx - 1, (int)by - 1, (int)bw, (int)bh,
                  0, 255, 0);
+    }
+
+    // Labels are drawn in a second pass so a later box's outline
+    // never paints over an earlier box's text.
+    for (int i = 0; i < N; ++i) {
+        unsigned int lb = labels_data[i];
+        const char* name = (lb >= 1 && (int)lb <= NUM_CLASSES)
+                           ? CLASS_NAMES[lb - 1] : "?";
+        char label[64];
+        std::snprintf(label, sizeof(label), "%s %.2f", name, scores_data[i]);
+
+        drawLabel(raw, H, W,
+                  (int)bboxes_data[0 * N + i] - 1, (int)bboxes_data[1 * N + i] - 1,
+                  label, 2, 0, 255, 0);   // scale 2 -> 16 px tall text
     }
 
     // --- 6) Guardar PNG anotado ---
