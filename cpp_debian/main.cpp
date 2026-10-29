@@ -7,6 +7,8 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <algorithm>  // std::min, std::max
+#include <cmath>      // std::lround
 #include <climits>    // PATH_MAX
 #include <unistd.h>   // readlink
 
@@ -150,6 +152,63 @@ static void setCoderDataPath() {
     setenv("CODER_DATA_PATH", dataDir.c_str(), 0);  // 0 = don't overwrite
 }
 
+// How the original image was placed inside the fixed W x H network input.
+// Needed to map the detected bboxes back to original-image coordinates.
+struct Letterbox {
+    double scale;  // original px -> letterbox px
+    int offX;      // left padding (px) in the letterbox
+    int offY;      // top padding (px) in the letterbox
+};
+
+// "Letterbox" resize: scales src (sw x sh, RGB interleaved) to fit inside
+// dst (dw x dh) WITHOUT distorting the aspect ratio, centers it, and fills
+// the leftover borders with gray. Uses bilinear interpolation.
+static Letterbox letterboxResize(const uint8_t* src, int sw, int sh,
+                                 uint8_t* dst, int dw, int dh) {
+    Letterbox lb;
+    // Largest scale at which the whole image still fits
+    lb.scale = std::min((double)dw / sw, (double)dh / sh);
+    int nw = std::min(dw, (int)std::lround(sw * lb.scale));
+    int nh = std::min(dh, (int)std::lround(sh * lb.scale));
+    lb.offX = (dw - nw) / 2;
+    lb.offY = (dh - nh) / 2;
+
+    // Padding color: mid gray (128), the usual choice for YOLO letterboxing
+    std::memset(dst, 128, (size_t)dw * dh * 3);
+
+    for (int dy = 0; dy < nh; ++dy) {
+        // Map the center of the destination pixel back into the source image.
+        // With scale == 1 this gives sy == dy exactly (plain copy).
+        double sy = (dy + 0.5) / lb.scale - 0.5;
+        sy = std::max(0.0, std::min(sy, (double)(sh - 1)));
+        int    y0 = (int)sy;
+        int    y1 = std::min(y0 + 1, sh - 1);
+        double fy = sy - y0;  // vertical weight toward y1
+
+        for (int dx = 0; dx < nw; ++dx) {
+            double sx = (dx + 0.5) / lb.scale - 0.5;
+            sx = std::max(0.0, std::min(sx, (double)(sw - 1)));
+            int    x0 = (int)sx;
+            int    x1 = std::min(x0 + 1, sw - 1);
+            double fx = sx - x0;  // horizontal weight toward x1
+
+            const uint8_t* p00 = src + (y0 * sw + x0) * 3;
+            const uint8_t* p01 = src + (y0 * sw + x1) * 3;
+            const uint8_t* p10 = src + (y1 * sw + x0) * 3;
+            const uint8_t* p11 = src + (y1 * sw + x1) * 3;
+            uint8_t* q = dst + ((dy + lb.offY) * dw + (dx + lb.offX)) * 3;
+
+            for (int c = 0; c < 3; ++c) {
+                // Blend the 4 neighbors: first along x, then along y
+                double top = p00[c] + (p01[c] - p00[c]) * fx;
+                double bot = p10[c] + (p11[c] - p10[c]) * fx;
+                q[c] = (uint8_t)std::lround(top + (bot - top) * fy);
+            }
+        }
+    }
+    return lb;
+}
+
 int main(int argc, char** argv) {
     const char* inPath  = (argc > 1) ? argv[1] : "gato.png";
     const char* outPath = (argc > 2) ? argv[2] : "out.png";
@@ -157,21 +216,20 @@ int main(int argc, char** argv) {
     // Must run before yolov2_detect_initialize() / yolov2_detect()
     setCoderDataPath();
 
-    // --- 1) Leer imagen ---
+    // --- 1) Leer imagen (cualquier tamano) ---
     int w, h, ch;
     uint8_t* raw = stbi_load(inPath, &w, &h, &ch, 3);
     if (!raw) {
         std::fprintf(stderr, "No pude abrir %s\n", inPath);
         return 1;
     }
-    if (w != W || h != H) {
-        std::fprintf(stderr,
-            "Tamano de imagen (%dx%d) != esperado (%dx%d). "
-            "Redimensiona o regenera con imgType variable.\n",
-            w, h, W, H);
-        stbi_image_free(raw);
-        return 2;
-    }
+
+    // The network input is fixed at W x H, so fit the image into it.
+    // `raw` stays untouched at its original size: that's what we draw on.
+    static uint8_t boxed[IN_SIZE];
+    const Letterbox lbx = letterboxResize(raw, w, h, boxed, W, H);
+    std::printf("Imagen %dx%d -> letterbox %dx%d (escala %.3f, offset %d,%d)\n",
+                w, h, W, H, lbx.scale, lbx.offX, lbx.offY);
 
     // --- 2) Convertir a layout MATLAB: column-major, planar HxWx3 uint8 ---
     // stb: row-major, RGB interleaved (idx = (y*W + x)*3 + c)
@@ -180,7 +238,7 @@ int main(int argc, char** argv) {
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             for (int c = 0; c < C; ++c) {
-                in[(c * W + x) * H + y] = raw[(y * W + x) * 3 + c];
+                in[(c * W + x) * H + y] = boxed[(y * W + x) * 3 + c];
             }
         }
     }
@@ -206,23 +264,51 @@ int main(int argc, char** argv) {
     const int N = bboxes_size[0];
     std::printf("Detecciones: %d\n", N);
 
-    // --- 5) Dibujar ---
+    // --- 5) Pasar bboxes a coordenadas de la imagen original ---
     // bboxes_data es Nx4 column-major -> col c fila i en idx (c*N + i)
+    // Boxes come back in letterbox coords, MATLAB style: [x y w h], 1-based.
+    // Undo the letterbox: remove the padding offset, then divide by the scale.
+    // Corners are clipped so boxes reaching into the gray padding stay inside.
+    std::vector<int> boxX(N), boxY(N), boxW(N), boxH(N);  // 0-based, original px
     for (int i = 0; i < N; ++i) {
         double bx = bboxes_data[0 * N + i];
         double by = bboxes_data[1 * N + i];
         double bw = bboxes_data[2 * N + i];
         double bh = bboxes_data[3 * N + i];
-        float  sc = scores_data[i];
+
+        double x0 = (bx - 1      - lbx.offX) / lbx.scale;  // left
+        double y0 = (by - 1      - lbx.offY) / lbx.scale;  // top
+        double x1 = (bx - 1 + bw - lbx.offX) / lbx.scale;  // right (exclusive)
+        double y1 = (by - 1 + bh - lbx.offY) / lbx.scale;  // bottom (exclusive)
+        x0 = std::max(0.0, std::min(x0, (double)w));
+        x1 = std::max(0.0, std::min(x1, (double)w));
+        y0 = std::max(0.0, std::min(y0, (double)h));
+        y1 = std::max(0.0, std::min(y1, (double)h));
+
+        boxX[i] = (int)std::lround(x0);
+        boxY[i] = (int)std::lround(y0);
+        boxW[i] = (int)std::lround(x1) - boxX[i];
+        boxH[i] = (int)std::lround(y1) - boxY[i];
+
         unsigned int lb = labels_data[i];  // 1-based
         const char* name = (lb >= 1 && (int)lb <= NUM_CLASSES)
                            ? CLASS_NAMES[lb - 1] : "?";
-        std::printf("  #%d  lb=%u  %-10s  score=%.3f  bbox=[%.1f %.1f %.1f %.1f]\n",
-                    i, lb, name, sc, bx, by, bw, bh);
+        // Printed 1-based like MATLAB, in original-image coordinates
+        std::printf("  #%d  lb=%u  %-10s  score=%.3f  bbox=[%d %d %d %d]\n",
+                    i, lb, name, scores_data[i],
+                    boxX[i] + 1, boxY[i] + 1, boxW[i], boxH[i]);
+    }
 
-        drawRect(raw, H, W,
-                 (int)bx - 1, (int)by - 1, (int)bw, (int)bh,
-                 0, 255, 0);
+    // --- 6) Dibujar sobre la imagen original ---
+    // Line thickness and text size grow with the image so they look the same
+    // on a small or a large picture (720p -> 3 px lines, 16 px text).
+    const int minSide    = std::min(w, h);
+    const int thick      = std::max(1, minSide / 240);
+    const int labelScale = std::max(1, (int)std::lround(minSide / 360.0));
+
+    for (int i = 0; i < N; ++i) {
+        drawRect(raw, h, w, boxX[i], boxY[i], boxW[i], boxH[i],
+                 0, 255, 0, thick);
     }
 
     // Labels are drawn in a second pass so a later box's outline
@@ -234,13 +320,11 @@ int main(int argc, char** argv) {
         char label[64];
         std::snprintf(label, sizeof(label), "%s %.2f", name, scores_data[i]);
 
-        drawLabel(raw, H, W,
-                  (int)bboxes_data[0 * N + i] - 1, (int)bboxes_data[1 * N + i] - 1,
-                  label, 2, 0, 255, 0);   // scale 2 -> 16 px tall text
+        drawLabel(raw, h, w, boxX[i], boxY[i], label, labelScale, 0, 255, 0);
     }
 
-    // --- 6) Guardar PNG anotado ---
-    if (!stbi_write_png(outPath, W, H, 3, raw, W * 3)) {
+    // --- 7) Guardar PNG anotado (tamano original) ---
+    if (!stbi_write_png(outPath, w, h, 3, raw, w * 3)) {
         std::fprintf(stderr, "No pude escribir %s\n", outPath);
     } else {
         std::printf("Guardado: %s\n", outPath);
